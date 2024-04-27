@@ -1,0 +1,219 @@
+#include <stdint.h>
+#include <stdlib.h>
+#include <stddef.h>
+#include <threads.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include "queue.h"
+
+
+typedef struct elem_queue{ //struct for the main queue's elements
+    struct elem_node* head;
+    struct elem_node* tail;
+}elem_queue;
+
+
+typedef struct elem_node{  //struct for the main queue's elements
+    struct elem_node* next;
+    struct elem_node* prev;
+    void* value;
+}elem_node;
+
+
+typedef struct thread_queue{ //struct for the threads queue 
+    struct thread_node* head;
+    struct thread_node* tail;
+}thread_queue;
+
+
+typedef struct thread_node{  //struct for the threads queue's elements
+    struct thread_node* next;
+    struct thread_node* prev;
+    void* elem;
+    cnd_t cond;
+}thread_node;
+
+
+elem_queue main_queue;
+thread_queue thr_queue;
+atomic_size_t size_num;
+atomic_size_t waiting_num;
+atomic_size_t visited_num;
+mtx_t lock;
+
+
+void initQueue(void){
+    mtx_init(&lock, mtx_plain);
+    mtx_lock(&lock);
+    main_queue.head = NULL;
+    main_queue.tail = NULL;
+    size_num = 0;
+    waiting_num = 0;
+    visited_num = 0;
+    thr_queue.head = NULL;
+    thr_queue.tail = NULL;
+    mtx_unlock(&lock);
+}
+
+
+void free_elem_queue(){
+    elem_node* curr_node;
+    elem_node* node_to_free;
+    curr_node = main_queue.head;
+    while (curr_node != NULL){
+        node_to_free = curr_node;
+        curr_node = curr_node->next;
+        free(node_to_free);
+    }
+    main_queue.head = NULL;
+    main_queue.tail = NULL;
+    size_num = 0;
+    waiting_num = 0;
+}
+
+
+void free_thread_queue(){
+    thread_node* curr_node;
+    thread_node* node_to_free;
+    curr_node = thr_queue.head;
+    while (curr_node != NULL){
+        node_to_free = curr_node;
+        curr_node = curr_node->next;
+        free(node_to_free);
+    }
+    thr_queue.head = NULL;
+    thr_queue.tail = NULL;
+}
+
+
+void destroyQueue(void){
+    mtx_lock(&lock);
+    free_elem_queue();
+    free_thread_queue();
+    mtx_unlock(&lock);
+    mtx_destroy(&lock);
+}
+
+
+void enqueue(void* element){
+    mtx_lock(&lock);
+    thread_node* waiting_thread;
+    elem_node* new_node;
+    if (thr_queue.head != NULL){ //there is one or more threads waiting for insert
+        waiting_thread = thr_queue.head; //getting the "first" waiting thread
+        if (waiting_thread->next != NULL){ //if there was more then one thread waiting
+            thr_queue.head = waiting_thread->next;
+            thr_queue.head->prev = NULL;
+        }
+        else{ //there was only one thread waiting
+            thr_queue.head = NULL;
+            thr_queue.tail = NULL;
+        }
+        waiting_thread->elem = element;
+        cnd_signal(&waiting_thread->cond);
+    }
+    else{
+        new_node = malloc(sizeof(elem_node));
+        new_node->next = NULL;
+        new_node->value = element;
+        if (main_queue.tail != NULL){
+            main_queue.tail->next = new_node;
+            main_queue.tail->next->prev = main_queue.tail;
+            main_queue.tail = main_queue.tail->next;
+        }
+        else{
+            main_queue.head = new_node;
+            main_queue.tail = new_node;
+        }
+    }
+    size_num++;
+    mtx_unlock(&lock);
+}
+
+
+void* dequeue(void){
+    mtx_lock(&lock);
+    thread_node* new_thread;
+    elem_node* curr_head;
+    void* element;
+    if (main_queue.head == NULL){ //if there are no elements in the main queue to be dequeued
+        new_thread = malloc(sizeof(thread_node));
+        new_thread->next = NULL;
+        cnd_init(&new_thread->cond);
+        if (thr_queue.head != NULL){ //there are threads already waiting
+            thr_queue.tail->next = new_thread;
+            thr_queue.tail->next->prev = thr_queue.tail;
+            thr_queue.tail = new_thread;
+        }
+        else{
+            thr_queue.head = new_thread;
+            thr_queue.tail = new_thread;
+        }
+        waiting_num++;
+        cnd_wait(&new_thread->cond, &lock);
+        element = new_thread->elem;
+        waiting_num--;
+        cnd_destroy(&new_thread->cond);
+        free(new_thread);
+        size_num--;
+        visited_num++;
+    }
+    else{ //there are elements in the main queue to be dequeued
+        curr_head = main_queue.head;
+        if (curr_head->next == NULL){ //there is only one element to be dequeued
+            main_queue.head = NULL;
+            main_queue.tail = NULL;
+        }
+        else{ //there is more then one element to be dequeued
+            main_queue.head = curr_head->next;
+            main_queue.head->prev = NULL;
+        }
+        size_num--;
+        visited_num++;
+        element = curr_head->value;
+        free(curr_head);
+    }
+    mtx_unlock(&lock);
+    return element;
+}
+
+
+bool tryDequeue(void** pointer){
+    mtx_lock(&lock);
+    elem_node* curr;
+    if (main_queue.head != NULL){ //if there are elements to be dequeued
+        curr = main_queue.head;
+        main_queue.head = curr->next;
+        if (curr->next == NULL){ //there was only one element to be dequeued
+            main_queue.tail = NULL;
+        }
+        else{ //there was more then one element to be dequeued
+            main_queue.head->prev = NULL;
+        }
+        *pointer = curr->value;
+        free(curr);
+        size_num--;
+        visited_num++;
+        mtx_unlock(&lock);
+        return true;
+    }
+    else{
+        mtx_unlock(&lock);
+        return false;
+    }
+}
+
+
+size_t size(void){
+    return (size_t)size_num;
+}
+
+
+size_t waiting(void){
+    return (size_t)waiting_num;
+}
+
+
+size_t visited(void){
+    return (size_t)visited_num;
+}
